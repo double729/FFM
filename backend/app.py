@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from decimal import Decimal
 from typing import Dict
 
@@ -10,11 +12,31 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from sqlalchemy import and_, select
 
-from .database import init_db, session_scope
-from .models import Candle, SimulatedTrade
-from .services.market_data import convert_to_models, fetch_candles, list_available_contracts, load_candles_from_db
-from .services.playback import PlaybackManager
-from .services.trading import DIRECTION_MULTIPLIER, summarize_portfolio
+if __package__:
+    from .database import init_db, session_scope
+    from .models import Candle, SimulatedTrade
+    from .services.market_data import (
+        convert_to_models,
+        fetch_candles,
+        list_available_contracts,
+        load_candles_from_db,
+    )
+    from .services.playback import PlaybackManager
+    from .services.trading import DIRECTION_MULTIPLIER, summarize_portfolio
+else:  # pragma: no cover - convenience for running ``python backend/app.py``
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    if current_dir not in sys.path:
+        sys.path.insert(0, current_dir)
+    from database import init_db, session_scope
+    from models import Candle, SimulatedTrade
+    from services.market_data import (
+        convert_to_models,
+        fetch_candles,
+        list_available_contracts,
+        load_candles_from_db,
+    )
+    from services.playback import PlaybackManager
+    from services.trading import DIRECTION_MULTIPLIER, summarize_portfolio
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
