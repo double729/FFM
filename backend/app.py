@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import sys
-from decimal import Decimal
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -15,7 +14,7 @@ from sqlalchemy import and_, select
 
 if __package__:
     from .database import init_db, session_scope
-    from .models import Candle, SimulatedTrade
+    from .models import Candle, SimulatedOrder, SimulatedTrade
     from .services.market_data import (
         convert_to_models,
         fetch_candles,
@@ -23,13 +22,13 @@ if __package__:
         load_candles_from_db,
     )
     from .services.playback import PlaybackManager
-    from .services.trading import DIRECTION_MULTIPLIER, summarize_portfolio
+    from .services.trading import DIRECTION_MULTIPLIER, TradingEngine
 else:  # pragma: no cover - convenience for running ``python backend/app.py``
     current_dir = os.path.dirname(os.path.abspath(__file__))
     if current_dir not in sys.path:
         sys.path.insert(0, current_dir)
     from database import init_db, session_scope
-    from models import Candle, SimulatedTrade
+    from models import Candle, SimulatedOrder, SimulatedTrade
     from services.market_data import (
         convert_to_models,
         fetch_candles,
@@ -37,7 +36,7 @@ else:  # pragma: no cover - convenience for running ``python backend/app.py``
         load_candles_from_db,
     )
     from services.playback import PlaybackManager
-    from services.trading import DIRECTION_MULTIPLIER, summarize_portfolio
+    from services.trading import DIRECTION_MULTIPLIER, TradingEngine
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -52,6 +51,13 @@ def _get_playback_manager() -> PlaybackManager:
     if manager is None:  # pragma: no cover - defensive guard
         raise RuntimeError("Playback manager is not initialised")
     return manager
+
+
+def _get_trading_engine() -> TradingEngine:
+    engine = current_app.extensions.get("trading_engine")
+    if engine is None:  # pragma: no cover - defensive guard
+        raise RuntimeError("Trading engine is not initialised")
+    return engine
 
 
 @api_bp.route("/health", methods=["GET"])
@@ -235,7 +241,162 @@ def playback_next():
     except ValueError as exc:
         return {"message": str(exc)}, 400
 
-    return jsonify({"items": list(items), "status": state.as_dict(), "has_more": state.index < state.frame.shape[0]})
+    fills_payload: list[dict[str, object]] = []
+    trading_engine = _get_trading_engine()
+    if items:
+        with session_scope() as session:
+            fills = trading_engine.process_candles(session, state.symbol, items)
+            fills_payload = [
+                {
+                    "order_id": trade.order_id,
+                    "trade_id": trade.id,
+                    "symbol": trade.symbol,
+                    "direction": trade.direction,
+                    "price": float(trade.price),
+                    "quantity": trade.quantity,
+                    "trade_time": trade.trade_time.isoformat(),
+                }
+                for trade in fills
+            ]
+
+    return jsonify(
+        {
+            "items": list(items),
+            "status": state.as_dict(),
+            "has_more": state.index < state.frame.shape[0],
+            "fills": fills_payload,
+        }
+    )
+
+
+@api_bp.route("/orders", methods=["GET"])
+def list_orders():
+    """List all simulated orders ordered by creation time."""
+
+    with session_scope() as session:
+        orders = (
+            session.execute(
+                select(SimulatedOrder).order_by(SimulatedOrder.created_at.desc())
+            )
+            .scalars()
+            .all()
+        )
+
+    payload = [
+        {
+            "id": order.id,
+            "symbol": order.symbol,
+            "direction": order.direction,
+            "order_type": order.order_type,
+            "price": None if order.price is None else float(order.price),
+            "quantity": order.quantity,
+            "filled_quantity": order.filled_quantity,
+            "avg_fill_price": None if order.avg_fill_price is None else float(order.avg_fill_price),
+            "status": order.status,
+            "created_at": order.created_at.isoformat(),
+            "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+            "note": order.note,
+        }
+        for order in orders
+    ]
+
+    return jsonify({"items": payload})
+
+
+@api_bp.route("/orders", methods=["POST"])
+def create_order():
+    """Submit a new simulated order."""
+
+    payload = request.get_json(force=True)
+    symbol = payload.get("symbol")
+    direction = payload.get("direction")
+    order_type = payload.get("order_type", "market")
+    quantity = payload.get("quantity", 1)
+    price = payload.get("price")
+    note = payload.get("note")
+
+    if not symbol or direction not in DIRECTION_MULTIPLIER:
+        return {"message": "symbol 和 direction (buy/sell) 必填"}, 400
+    try:
+        quantity_int = int(quantity)
+    except (TypeError, ValueError):
+        return {"message": "quantity 必须为整数"}, 400
+    if quantity_int <= 0:
+        return {"message": "quantity 必须大于 0"}, 400
+
+    trading_engine = _get_trading_engine()
+    with session_scope() as session:
+        try:
+            order, fills = trading_engine.place_order(
+                session,
+                symbol=symbol,
+                direction=direction,
+                quantity=quantity_int,
+                order_type=order_type,
+                price=float(price) if price is not None else None,
+                note=note,
+            )
+            session.flush()
+        except ValueError as exc:
+            return {"message": str(exc)}, 400
+
+        order_payload = {
+            "id": order.id,
+            "symbol": order.symbol,
+            "direction": order.direction,
+            "order_type": order.order_type,
+            "price": None if order.price is None else float(order.price),
+            "quantity": order.quantity,
+            "filled_quantity": order.filled_quantity,
+            "avg_fill_price": None if order.avg_fill_price is None else float(order.avg_fill_price),
+            "status": order.status,
+            "created_at": order.created_at.isoformat(),
+            "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+            "note": order.note,
+        }
+        fills_payload = [
+            {
+                "trade_id": trade.id,
+                "order_id": trade.order_id,
+                "symbol": trade.symbol,
+                "direction": trade.direction,
+                "price": float(trade.price),
+                "quantity": trade.quantity,
+                "trade_time": trade.trade_time.isoformat(),
+            }
+            for trade in fills
+        ]
+
+    return jsonify({"order": order_payload, "fills": fills_payload}), 201
+
+
+@api_bp.route("/orders/<int:order_id>/cancel", methods=["POST"])
+def cancel_order(order_id: int):
+    """Cancel an existing open order."""
+
+    trading_engine = _get_trading_engine()
+    with session_scope() as session:
+        try:
+            order = trading_engine.cancel_order(session, order_id)
+        except ValueError as exc:
+            return {"message": str(exc)}, 400
+
+        payload = {
+            "id": order.id,
+            "symbol": order.symbol,
+            "direction": order.direction,
+            "order_type": order.order_type,
+            "price": None if order.price is None else float(order.price),
+            "quantity": order.quantity,
+            "filled_quantity": order.filled_quantity,
+            "avg_fill_price": None if order.avg_fill_price is None else float(order.avg_fill_price),
+            "status": order.status,
+            "created_at": order.created_at.isoformat(),
+            "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+            "note": order.note,
+        }
+
+    return jsonify({"order": payload})
 
 
 @api_bp.route("/trades", methods=["GET"])
@@ -254,6 +415,7 @@ def get_trades():
             "quantity": trade.quantity,
             "trade_time": trade.trade_time.isoformat(),
             "note": trade.note,
+            "order_id": trade.order_id,
         }
         for trade in trades
     ]
@@ -263,36 +425,9 @@ def get_trades():
 
 @api_bp.route("/trades", methods=["POST"])
 def create_trade():
-    """Create a new simulated trade."""
+    """Deprecated direct trade creation entrypoint."""
 
-    payload = request.get_json(force=True)
-    symbol = payload.get("symbol")
-    direction = payload.get("direction")
-    price = payload.get("price")
-    quantity = payload.get("quantity", 1)
-    note = payload.get("note")
-
-    if not symbol or direction not in DIRECTION_MULTIPLIER:
-        return {"message": "symbol and direction (buy/sell) are required"}, 400
-    if price is None:
-        return {"message": "price is required"}, 400
-    if quantity <= 0:
-        return {"message": "quantity must be positive"}, 400
-
-    trade = SimulatedTrade(
-        symbol=symbol,
-        direction=direction,
-        price=Decimal(str(price)),
-        quantity=int(quantity),
-        note=note,
-    )
-
-    with session_scope() as session:
-        session.add(trade)
-        session.flush()
-        trade_id = trade.id
-
-    return {"id": trade_id}, 201
+    return {"message": "请通过 /api/orders 提交模拟交易"}, 405
 
 
 @api_bp.route("/trades/<int:trade_id>", methods=["DELETE"])
@@ -312,6 +447,7 @@ def delete_trade(trade_id: int):
 def portfolio_summary():
     """Return aggregated portfolio metrics."""
 
+    trading_engine = _get_trading_engine()
     with session_scope() as session:
         trades = session.execute(select(SimulatedTrade).order_by(SimulatedTrade.trade_time)).scalars().all()
         latest_candles: Dict[str, Candle] = {}
@@ -325,7 +461,7 @@ def portfolio_summary():
             if candle:
                 latest_candles[trade.symbol] = candle
 
-    summary = summarize_portfolio(trades, latest_candles)
+    summary = trading_engine.summarize(trades, latest_candles)
 
     return jsonify(
         {
@@ -334,11 +470,16 @@ def portfolio_summary():
                     "quantity": position.quantity,
                     "average_price": float(position.average_price),
                     "last_price": summary.last_mark_prices.get(symbol),
+                    "direction": position.direction,
                 }
                 for symbol, position in summary.positions.items()
             },
             "realized_pnl": float(summary.realized_pnl),
             "unrealized_pnl": float(summary.unrealized_pnl),
+            "cash": float(summary.cash),
+            "equity": float(summary.equity),
+            "margin_used": float(summary.margin_used),
+            "available_funds": float(summary.available_funds),
         }
     )
 
@@ -364,6 +505,9 @@ def create_app() -> Flask:
 
     playback_manager = PlaybackManager()
     app.extensions["playback_manager"] = playback_manager
+
+    trading_engine = TradingEngine()
+    app.extensions["trading_engine"] = trading_engine
 
     app.register_blueprint(api_bp, url_prefix="/api")
 

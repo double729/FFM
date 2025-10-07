@@ -168,6 +168,13 @@ table {
   font-size: 13px;
 }
 
+.sub-heading {
+  margin: 18px 0 8px;
+  font-size: 15px;
+  color: #1f2937;
+  font-weight: 600;
+}
+
 thead {
   background: #e0f2fe;
 }
@@ -197,6 +204,25 @@ th {
   display: flex;
   justify-content: space-between;
   align-items: center;
+}
+
+.account-summary {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+}
+
+.account-summary span {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.account-summary strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 16px;
+  color: #0f172a;
 }
 
 .pnl-summary {

@@ -40,16 +40,26 @@ createApp({
       message: '',
     });
 
+    const orders = ref([]);
     const trades = ref([]);
-    const tradeForm = reactive({
+    const orderForm = reactive({
       symbol: '',
       direction: 'buy',
+      orderType: 'market',
       price: '',
       quantity: 1,
       note: '',
     });
-    const tradeMessage = ref('');
-    const portfolio = reactive({ positions: {}, realized_pnl: 0, unrealized_pnl: 0 });
+    const orderMessage = ref('');
+    const portfolio = reactive({
+      positions: {},
+      realized_pnl: 0,
+      unrealized_pnl: 0,
+      cash: 0,
+      equity: 0,
+      margin_used: 0,
+      available_funds: 0,
+    });
 
     const hasPositions = computed(() => Object.keys(portfolio.positions || {}).length > 0);
 
@@ -270,6 +280,7 @@ createApp({
           params: { count: Math.max(1, Number(playback.batchSize) || 1) },
         });
         const items = data?.items || [];
+        const fills = data?.fills || [];
         if (items.length) {
           candles.value = candles.value.concat(items);
           await renderChart();
@@ -277,6 +288,12 @@ createApp({
         playback.status = data?.status || null;
         playback.hasMore = Boolean(data?.has_more);
         playback.message = '';
+        if (fills.length) {
+          orderMessage.value = `自动成交 ${fills.length} 笔订单`;
+          await loadTrades();
+          await loadOrders();
+          await loadPortfolio();
+        }
         if (!playback.hasMore) {
           playback.playing = false;
           clearPlaybackTimer();
@@ -375,55 +392,87 @@ createApp({
         const { data } = await api.get('/trades');
         trades.value = data?.items || [];
       } catch (error) {
-        tradeMessage.value = error?.response?.data?.message || error.message || '获取交易失败';
+        orderMessage.value = error?.response?.data?.message || error.message || '获取成交记录失败';
+      }
+    }
+
+    async function loadOrders() {
+      try {
+        const { data } = await api.get('/orders');
+        orders.value = (data?.items || []).map((item) => ({
+          ...item,
+          price: item.price != null ? Number(item.price) : null,
+          avg_fill_price: item.avg_fill_price != null ? Number(item.avg_fill_price) : null,
+        }));
+      } catch (error) {
+        orderMessage.value = error?.response?.data?.message || error.message || '获取订单失败';
+      }
+    }
+
+    async function cancelOrder(id) {
+      try {
+        await api.post(`/orders/${id}/cancel`);
+        orderMessage.value = '撤单成功';
+        await loadOrders();
+        await loadPortfolio();
+      } catch (error) {
+        orderMessage.value = error?.response?.data?.message || error.message || '撤单失败';
+      }
+    }
+
+    async function submitOrder() {
+      if (!orderForm.symbol) {
+        orderMessage.value = '请填写交易品种';
+        return;
+      }
+      const quantity = Math.floor(Number(orderForm.quantity));
+      if (!Number.isFinite(quantity) || quantity <= 0) {
+        orderMessage.value = '数量必须为正数';
+        return;
+      }
+      const normalizedSymbol = (orderForm.symbol || '').trim().toUpperCase();
+      orderForm.symbol = normalizedSymbol;
+      const payload = {
+        symbol: normalizedSymbol,
+        direction: orderForm.direction,
+        order_type: orderForm.orderType,
+        quantity,
+        note: orderForm.note || undefined,
+      };
+      if (orderForm.orderType === 'limit') {
+        const price = Number(orderForm.price);
+        if (!Number.isFinite(price) || price <= 0) {
+          orderMessage.value = '限价单需填写有效价格';
+          return;
+        }
+        payload.price = price;
+      } else if (orderForm.orderType === 'market' && orderForm.price) {
+        const fallbackPrice = Number(orderForm.price);
+        if (Number.isFinite(fallbackPrice) && fallbackPrice > 0) {
+          payload.price = fallbackPrice;
+        }
+      }
+      try {
+        await api.post('/orders', payload);
+        orderMessage.value = '订单已提交';
+        orderForm.price = '';
+        orderForm.note = '';
+        await loadOrders();
+        await loadTrades();
+        await loadPortfolio();
+      } catch (error) {
+        orderMessage.value = error?.response?.data?.message || error.message || '下单失败';
       }
     }
 
     async function removeTrade(id) {
       try {
         await api.delete(`/trades/${id}`);
-        tradeMessage.value = '删除成功';
+        orderMessage.value = '成交记录已删除';
         await loadTrades();
         await loadPortfolio();
       } catch (error) {
-        tradeMessage.value = error?.response?.data?.message || error.message || '删除失败';
-      }
-    }
-
-    async function submitTrade() {
-      if (!tradeForm.symbol) {
-        tradeMessage.value = '请填写交易品种';
-        return;
-      }
-      const price = Number(tradeForm.price);
-      const quantity = Math.floor(Number(tradeForm.quantity));
-      if (!Number.isFinite(price) || price <= 0) {
-        tradeMessage.value = '价格必须大于 0';
-        return;
-      }
-      if (!Number.isFinite(quantity) || quantity <= 0) {
-        tradeMessage.value = '数量必须为正数';
-        return;
-      }
-      try {
-        const normalizedSymbol = (tradeForm.symbol || '').trim().toUpperCase();
-        tradeForm.symbol = normalizedSymbol;
-        const payload = {
-          symbol: normalizedSymbol,
-          direction: tradeForm.direction,
-          price,
-          quantity,
-          note: tradeForm.note || undefined,
-        };
-        await api.post('/trades', payload);
-        tradeMessage.value = '交易已记录';
-        tradeForm.price = '';
-        tradeForm.quantity = 1;
-        tradeForm.note = '';
-        await loadTrades();
-        await loadPortfolio();
-      } catch (error) {
-        tradeMessage.value = error?.response?.data?.message || error.message || '下单失败';
+        orderMessage.value = error?.response?.data?.message || error.message || '删除失败';
       }
     }
 
@@ -442,8 +491,12 @@ createApp({
         portfolio.positions = normalizedPositions;
         portfolio.realized_pnl = Number(data?.realized_pnl || 0);
         portfolio.unrealized_pnl = Number(data?.unrealized_pnl || 0);
+        portfolio.cash = Number(data?.cash || 0);
+        portfolio.equity = Number(data?.equity || 0);
+        portfolio.margin_used = Number(data?.margin_used || 0);
+        portfolio.available_funds = Number(data?.available_funds || 0);
       } catch (error) {
-        tradeMessage.value = error?.response?.data?.message || error.message || '刷新持仓失败';
+        orderMessage.value = error?.response?.data?.message || error.message || '刷新持仓失败';
       }
     }
 
@@ -459,7 +512,7 @@ createApp({
       filters.interval = info.interval;
       filters.startDate = info.start_date ? info.start_date.slice(0, 10) : filters.startDate;
       filters.endDate = info.end_date ? info.end_date.slice(0, 10) : filters.endDate;
-      tradeForm.symbol = info.symbol;
+      orderForm.symbol = info.symbol;
       loadCandles();
     });
 
@@ -467,7 +520,7 @@ createApp({
       () => filters.symbol,
       (value) => {
         if (value) {
-          tradeForm.symbol = value;
+          orderForm.symbol = value;
         }
       }
     );
@@ -484,6 +537,7 @@ createApp({
     onMounted(async () => {
       ensureChart();
       await refreshContracts();
+      await loadOrders();
       await loadTrades();
       await loadPortfolio();
     });
@@ -503,10 +557,13 @@ createApp({
       pausePlayback,
       resumePlayback,
       manualStep,
+      orders,
       trades,
-      tradeForm,
-      tradeMessage,
-      submitTrade,
+      orderForm,
+      orderMessage,
+      submitOrder,
+      cancelOrder,
+      loadOrders,
       loadTrades,
       removeTrade,
       portfolio,

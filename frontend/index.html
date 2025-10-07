@@ -115,45 +115,102 @@
 
         <section class="panel">
           <h2>模拟交易</h2>
-          <form @submit.prevent="submitTrade">
+          <form @submit.prevent="submitOrder">
             <div class="form-grid">
               <label>
                 <span>品种</span>
-                <input v-model="tradeForm.symbol" placeholder="如：RB2210" required />
+                <input v-model="orderForm.symbol" placeholder="如：RB2210" required />
               </label>
               <label>
                 <span>方向</span>
-                <select v-model="tradeForm.direction">
+                <select v-model="orderForm.direction">
                   <option value="buy">买入</option>
                   <option value="sell">卖出</option>
                 </select>
               </label>
               <label>
-                <span>价格</span>
-                <input v-model.number="tradeForm.price" type="number" step="0.01" required />
+                <span>订单类型</span>
+                <select v-model="orderForm.orderType">
+                  <option value="market">市价</option>
+                  <option value="limit">限价</option>
+                </select>
+              </label>
+              <label>
+                <span>{{ orderForm.orderType === 'limit' ? '限价' : '参考价 (可选)' }}</span>
+                <input
+                  v-model.number="orderForm.price"
+                  type="number"
+                  step="0.01"
+                  :required="orderForm.orderType === 'limit'"
+                  :placeholder="orderForm.orderType === 'limit' ? '必填' : '可选'"
+                />
               </label>
               <label>
                 <span>数量</span>
-                <input v-model.number="tradeForm.quantity" type="number" min="1" required />
+                <input v-model.number="orderForm.quantity" type="number" min="1" required />
               </label>
             </div>
             <label>
               <small>备注</small>
-              <textarea v-model="tradeForm.note" rows="2" placeholder="可选" />
+              <textarea v-model="orderForm.note" rows="2" placeholder="可选" />
             </label>
             <div class="actions" style="margin-top: 12px;">
-              <button type="submit">记录交易</button>
-              <button type="button" @click="loadTrades">刷新列表</button>
+              <button type="submit">提交订单</button>
+              <button type="button" @click="loadOrders">刷新订单</button>
+              <button type="button" @click="loadTrades">刷新成交</button>
               <button type="button" @click="loadPortfolio">刷新持仓</button>
             </div>
           </form>
-          <p v-if="tradeMessage" class="message">{{ tradeMessage }}</p>
+          <p v-if="orderMessage" class="message">{{ orderMessage }}</p>
 
+          <h3 class="sub-heading">当前订单</h3>
+          <div class="table-wrapper" v-if="orders.length">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>品种</th>
+                  <th>方向</th>
+                  <th>类型</th>
+                  <th>价格</th>
+                  <th>数量</th>
+                  <th>已成交</th>
+                  <th>均价</th>
+                  <th>状态</th>
+                  <th>时间</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="item in orders" :key="item.id">
+                  <td>{{ item.id }}</td>
+                  <td>{{ item.symbol }}</td>
+                  <td>{{ item.direction }}</td>
+                  <td>{{ item.order_type }}</td>
+                  <td>{{ item.price != null ? item.price.toFixed(2) : '-' }}</td>
+                  <td>{{ item.quantity }}</td>
+                  <td>{{ item.filled_quantity }}</td>
+                  <td>{{ item.avg_fill_price != null ? item.avg_fill_price.toFixed(2) : '-' }}</td>
+                  <td>{{ item.status }}</td>
+                  <td>{{ item.created_at.replace('T', ' ').slice(0, 19) }}</td>
+                  <td>
+                    <div class="trade-actions">
+                      <button type="button" @click="cancelOrder(item.id)" v-if="item.status === 'open'">撤单</button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-else class="empty-hint">暂无订单。</div>
+
+          <h3 class="sub-heading">成交记录</h3>
           <div class="table-wrapper" v-if="trades.length">
             <table>
               <thead>
                 <tr>
                   <th>ID</th>
+                  <th>订单</th>
                   <th>品种</th>
                   <th>方向</th>
                   <th>价格</th>
@@ -166,6 +223,7 @@
               <tbody>
                 <tr v-for="item in trades" :key="item.id">
                   <td>{{ item.id }}</td>
+                  <td>{{ item.order_id || '-' }}</td>
                   <td>{{ item.symbol }}</td>
                   <td>{{ item.direction }}</td>
                   <td>{{ item.price.toFixed(2) }}</td>
@@ -181,7 +239,7 @@
               </tbody>
             </table>
           </div>
-          <div v-else class="empty-hint">暂无交易记录。</div>
+          <div v-else class="empty-hint">暂无成交记录。</div>
         </section>
 
         <section class="panel">
@@ -190,15 +248,34 @@
             <div class="position-item" v-for="(pos, symbol) in portfolio.positions" :key="symbol">
               <div>
                 <strong>{{ symbol }}</strong>
+                <div>方向：{{ pos.direction }}</div>
                 <div>数量：{{ pos.quantity }}</div>
                 <div>均价：{{ pos.average_price.toFixed(2) }}</div>
               </div>
               <div>
-                <div>最新价：{{ (pos.last_price ?? '-') }}</div>
+                <div>最新价：{{ pos.last_price != null ? pos.last_price.toFixed(2) : '-' }}</div>
               </div>
             </div>
           </div>
           <div v-else class="empty-hint">暂无持仓。</div>
+          <div class="account-summary">
+            <div>
+              <span>现金余额</span>
+              <strong>{{ portfolio.cash.toFixed(2) }}</strong>
+            </div>
+            <div>
+              <span>账户权益</span>
+              <strong>{{ portfolio.equity.toFixed(2) }}</strong>
+            </div>
+            <div>
+              <span>保证金占用</span>
+              <strong>{{ portfolio.margin_used.toFixed(2) }}</strong>
+            </div>
+            <div>
+              <span>可用资金</span>
+              <strong>{{ portfolio.available_funds.toFixed(2) }}</strong>
+            </div>
+          </div>
           <div class="pnl-summary">
             <div>已实现盈亏：{{ portfolio.realized_pnl.toFixed(2) }}</div>
             <div>未实现盈亏：{{ portfolio.unrealized_pnl.toFixed(2) }}</div>
