@@ -5,10 +5,11 @@ from __future__ import annotations
 import os
 import sys
 from decimal import Decimal
-from typing import Dict
+from pathlib import Path
+from typing import Dict, Optional
 
 import pandas as pd
-from flask import Flask, jsonify, request
+from flask import Blueprint, Flask, jsonify, request, current_app
 from flask_cors import CORS
 from sqlalchemy import and_, select
 
@@ -38,22 +39,29 @@ else:  # pragma: no cover - convenience for running ``python backend/app.py``
     from services.playback import PlaybackManager
     from services.trading import DIRECTION_MULTIPLIER, summarize_portfolio
 
-app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
-init_db()
+
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_FRONTEND_DIR = BASE_DIR.parent / "frontend"
 
 
-playback_manager = PlaybackManager()
+api_bp = Blueprint("api", __name__)
 
 
-@app.route("/api/health", methods=["GET"])
+def _get_playback_manager() -> PlaybackManager:
+    manager = current_app.extensions.get("playback_manager")
+    if manager is None:  # pragma: no cover - defensive guard
+        raise RuntimeError("Playback manager is not initialised")
+    return manager
+
+
+@api_bp.route("/health", methods=["GET"])
 def health() -> tuple[Dict[str, str], int]:
     """Simple health check endpoint."""
 
     return {"status": "ok"}, 200
 
 
-@app.route("/api/import", methods=["POST"])
+@api_bp.route("/import", methods=["POST"])
 def import_data() -> tuple[Dict[str, str], int]:
     """Fetch data from AkShare and load into SQLite."""
 
@@ -98,14 +106,14 @@ def import_data() -> tuple[Dict[str, str], int]:
     return {"imported": imported}, 201
 
 
-@app.route("/api/contracts", methods=["GET"])
+@api_bp.route("/contracts", methods=["GET"])
 def contracts():
     """Return imported contract metadata."""
 
     return jsonify({"items": list_available_contracts()})
 
 
-@app.route("/api/candles", methods=["GET"])
+@api_bp.route("/candles", methods=["GET"])
 def list_candles():
     """Return candles with indicators for the chart."""
 
@@ -146,7 +154,7 @@ def list_candles():
     return jsonify({"items": response})
 
 
-@app.route("/api/playback/start", methods=["POST"])
+@api_bp.route("/playback/start", methods=["POST"])
 def playback_start():
     payload = request.get_json(force=True)
     symbol = payload.get("symbol")
@@ -157,8 +165,10 @@ def playback_start():
     if not symbol:
         return {"message": "symbol is required"}, 400
 
+    manager = _get_playback_manager()
+
     try:
-        state = playback_manager.start(
+        state = manager.start(
             symbol,
             interval=interval,
             start_date=start_date,
@@ -170,57 +180,65 @@ def playback_start():
     return jsonify({"status": state.as_dict()})
 
 
-@app.route("/api/playback/pause", methods=["POST"])
+@api_bp.route("/playback/pause", methods=["POST"])
 def playback_pause():
+    manager = _get_playback_manager()
+
     try:
-        state = playback_manager.pause()
+        state = manager.pause()
     except ValueError as exc:
         return {"message": str(exc)}, 400
     return jsonify({"status": state.as_dict()})
 
 
-@app.route("/api/playback/resume", methods=["POST"])
+@api_bp.route("/playback/resume", methods=["POST"])
 def playback_resume():
+    manager = _get_playback_manager()
+
     try:
-        state = playback_manager.resume()
+        state = manager.resume()
     except ValueError as exc:
         return {"message": str(exc)}, 400
     return jsonify({"status": state.as_dict()})
 
 
-@app.route("/api/playback/seek", methods=["POST"])
+@api_bp.route("/playback/seek", methods=["POST"])
 def playback_seek():
     payload = request.get_json(force=True)
     timestamp = payload.get("timestamp")
     if not timestamp:
         return {"message": "timestamp is required"}, 400
+    manager = _get_playback_manager()
+
     try:
-        state = playback_manager.seek(timestamp)
+        state = manager.seek(timestamp)
     except ValueError as exc:
         return {"message": str(exc)}, 400
     return jsonify({"status": state.as_dict()})
 
 
-@app.route("/api/playback/status", methods=["GET"])
+@api_bp.route("/playback/status", methods=["GET"])
 def playback_status():
-    state = playback_manager.status()
+    manager = _get_playback_manager()
+    state = manager.status()
     if not state:
         return jsonify({"status": None})
     return jsonify({"status": state.as_dict()})
 
 
-@app.route("/api/playback/next", methods=["GET"])
+@api_bp.route("/playback/next", methods=["GET"])
 def playback_next():
     count = request.args.get("count", default=1, type=int)
+    manager = _get_playback_manager()
     try:
-        items, state = playback_manager.next(count)
+        items, state = manager.next(count)
     except ValueError as exc:
         return {"message": str(exc)}, 400
 
     return jsonify({"items": list(items), "status": state.as_dict(), "has_more": state.index < state.frame.shape[0]})
 
 
-@app.route("/api/trades", methods=["GET"])
+@api_bp.route("/trades", methods=["GET"])
 def get_trades():
     """List stored simulated trades."""
 
@@ -243,7 +261,7 @@ def get_trades():
     return jsonify({"items": payload})
 
 
-@app.route("/api/trades", methods=["POST"])
+@api_bp.route("/trades", methods=["POST"])
 def create_trade():
     """Create a new simulated trade."""
 
@@ -277,7 +295,7 @@ def create_trade():
     return {"id": trade_id}, 201
 
 
-@app.route("/api/trades/<int:trade_id>", methods=["DELETE"])
+@api_bp.route("/trades/<int:trade_id>", methods=["DELETE"])
 def delete_trade(trade_id: int):
     """Delete a simulated trade by identifier."""
 
@@ -290,7 +308,7 @@ def delete_trade(trade_id: int):
     return {"status": "deleted"}, 200
 
 
-@app.route("/api/portfolio", methods=["GET"])
+@api_bp.route("/portfolio", methods=["GET"])
 def portfolio_summary():
     """Return aggregated portfolio metrics."""
 
@@ -324,6 +342,59 @@ def portfolio_summary():
         }
     )
 
+def _resolve_frontend_dir() -> Optional[Path]:
+    env_path = os.environ.get("FFM_FRONTEND_DIR")
+    if env_path:
+        path = Path(env_path).expanduser().resolve()
+        if path.exists():
+            return path
+    if DEFAULT_FRONTEND_DIR.exists():
+        return DEFAULT_FRONTEND_DIR.resolve()
+    return None
+
+
+def create_app() -> Flask:
+    frontend_dir = _resolve_frontend_dir()
+    static_folder = str(frontend_dir) if frontend_dir else None
+    app = Flask(__name__, static_folder=static_folder, static_url_path="")
+    app.config["FFM_FRONTEND_DIR"] = frontend_dir
+    CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+    init_db()
+
+    playback_manager = PlaybackManager()
+    app.extensions["playback_manager"] = playback_manager
+
+    app.register_blueprint(api_bp, url_prefix="/api")
+
+    if frontend_dir and (frontend_dir / "index.html").exists():
+
+        @app.route("/")
+        def index():  # pragma: no cover - thin wrapper
+            return app.send_static_file("index.html")
+
+    else:
+
+        @app.route("/")
+        def index_missing():  # pragma: no cover - thin wrapper
+            return (
+                jsonify(
+                    {
+                        "message": "Frontend assets not found. Set FFM_FRONTEND_DIR or place files under frontend/.",
+                    }
+                ),
+                404,
+            )
+
+    return app
+
+
+app = create_app()
+
+
+def main() -> None:  # pragma: no cover - CLI helper
+    app.run(host="0.0.0.0", port=8000, debug=True)
+
 
 if __name__ == "__main__":  # pragma: no cover
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    main()

@@ -14,30 +14,42 @@
 
 ## 运行说明
 
+> 💡 **Windows PowerShell 编码提示**：在执行以下命令前，请先运行 `chcp 65001` 或
+> `powershell -NoProfile -Command "$PSDefaultParameterValues['Out-File:Encoding']='utf8';[Console]::OutputEncoding=[Text.Encoding]::UTF8"`
+> 以避免中文输出乱码。
+
 ### 后端（Flask）
 
 ```bash
 cd backend
 python -m venv .venv
-source .venv/bin/activate  # Windows 使用 .venv\Scripts\activate
+source .venv/bin/activate  # Windows 使用 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-export FLASK_APP=app:app
+python -m backend  # 默认监听 http://127.0.0.1:8000
+```
+
+若希望手动控制 host/port，可在激活虚拟环境后执行：
+
+```bash
+set FLASK_APP=backend.app:create_app  # PowerShell 使用 $env:FLASK_APP="backend.app:create_app"
 flask run --host 0.0.0.0 --port 8000
 ```
 
 默认会使用 `backend/data/training.db` 作为 SQLite 数据库路径，可通过设置 `FFM_DATABASE_URL` 环境变量自定义位置。
+静态前端资源默认读取仓库根目录下的 `frontend/`，也可以通过 `FFM_FRONTEND_DIR` 指向自定义路径。
 
 ### 前端（静态页面）
 
-无需 npm 或构建工具，只需通过任意静态服务器或直接打开 HTML 文件即可。
+无需 npm 或构建工具，后端启动后会自动托管 `frontend/` 目录下的静态资源，访问 `http://127.0.0.1:8000/` 即可打开界面。
+
+如果希望单独部署前端，也可以使用任意静态服务器手动托管：
 
 ```bash
-# 推荐使用简易 http.server 提供静态访问
 cd frontend
 python -m http.server 5173
 ```
 
-随后在浏览器访问 `http://localhost:5173/index.html`（或直接在文件管理器中打开 `frontend/index.html`）。页面默认将 API 地址指向 `http://localhost:8000/api`，若后端监听地址不同，可在加载 `main.js` 前覆盖 `window.FFM_API_BASE`：
+随后访问 `http://localhost:5173/index.html`。页面默认将 API 地址指向 `http://localhost:8000/api`，若后端监听地址不同，可在加载 `main.js` 前覆盖 `window.FFM_API_BASE`：
 
 ```html
 <script>
