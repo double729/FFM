@@ -16,6 +16,22 @@ from ..utils.indicators import enrich_indicators
 DATE_FORMAT = "%Y-%m-%d"
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
+_COLUMN_MAPPING = {
+    "date": "event_time",
+    "datetime": "event_time",
+    "time": "event_time",
+    "open": "open",
+    "high": "high",
+    "low": "low",
+    "close": "close",
+    "volume": "volume",
+    "vol": "volume",
+    "成交量": "volume",
+    "amount": "turnover",
+    "turnover": "turnover",
+    "成交额": "turnover",
+}
+
 
 def _parse_date(date_str: str) -> datetime:
     """Parse a date string that may include time information."""
@@ -28,35 +44,93 @@ def _parse_date(date_str: str) -> datetime:
     raise ValueError(f"Unsupported date format: {date_str}")
 
 
+def _normalize_symbol(symbol: str) -> str:
+    """Normalize symbol strings for consistent storage and lookup."""
+
+    cleaned = (symbol or "").strip().upper()
+    if not cleaned:
+        raise ValueError("symbol is required")
+    return cleaned
+
+
+def _normalize_interval(interval: str | int | None) -> str:
+    """Normalize interval representation used across API and storage."""
+
+    if interval is None:
+        return "1d"
+
+    value = str(interval).strip().lower()
+    if value in {"1d", "day", "daily"}:
+        return "1d"
+    if value.endswith("m"):
+        value = value[:-1]
+    return value or "1d"
+
+
 def fetch_candles(symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
     """Fetch futures K-line data from AkShare."""
 
+    normalized_symbol = _normalize_symbol(symbol)
+    normalized_interval = _normalize_interval(interval)
+
     start_dt = _parse_date(start)
     end_dt = _parse_date(end)
+    if start_dt > end_dt:
+        raise ValueError("start date must not be after end date")
 
-    if interval == "1d":
-        raw = ak.futures_zh_daily_sina(symbol=symbol)
-        raw.rename(
-            columns={"date": "event_time", "open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume"},
-            inplace=True,
-        )
-        raw["event_time"] = pd.to_datetime(raw["event_time"])
-    else:
-        raw = ak.futures_zh_minute_sina(symbol=symbol, period=interval)
-        raw.rename(
-            columns={"datetime": "event_time", "open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume"},
-            inplace=True,
-        )
-        raw["event_time"] = pd.to_datetime(raw["event_time"])
+    raw = None
+    last_error: Exception | None = None
+    candidate_symbols: list[str] = []
+    original_symbol = (symbol or "").strip()
+    for candidate in (normalized_symbol, original_symbol, original_symbol.upper(), original_symbol.lower()):
+        if candidate and candidate not in candidate_symbols:
+            candidate_symbols.append(candidate)
 
-    filtered = raw[(raw["event_time"] >= start_dt) & (raw["event_time"] <= end_dt)].copy()
+    for candidate in candidate_symbols:
+        try:
+            if normalized_interval == "1d":
+                raw = ak.futures_zh_daily(symbol=candidate)
+            else:
+                period = normalized_interval or "1"
+                raw = ak.futures_zh_minute_sina(symbol=candidate, period=period)
+        except Exception as exc:  # pragma: no cover - AkShare runtime specific
+            last_error = exc
+            raw = None
+            continue
+
+        if raw is not None and not raw.empty:
+            break
+
+    if raw is None or raw.empty:
+        if last_error:
+            raise ValueError(f"AkShare 获取数据失败: {last_error}") from last_error
+        raise ValueError("AkShare 未返回任何数据，请确认合约代码与日期区间")
+
+    frame = raw.rename(columns=_COLUMN_MAPPING).copy()
+
+    if "event_time" not in frame.columns:
+        raise ValueError("AkShare 响应缺少时间字段，无法解析")
+
+    frame["event_time"] = pd.to_datetime(frame["event_time"], errors="coerce")
+    frame = frame.dropna(subset=["event_time"])
+
+    for col in ("open", "high", "low", "close", "volume", "turnover"):
+        if col in frame.columns:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+
+    filtered = frame[(frame["event_time"] >= start_dt) & (frame["event_time"] <= end_dt)].copy()
     filtered.sort_values("event_time", inplace=True)
 
-    if "turnover" not in filtered.columns:
-        filtered["turnover"] = None
+    if filtered.empty:
+        raise ValueError("指定日期区间内没有可用的行情数据")
 
-    filtered["interval"] = interval
-    filtered["symbol"] = symbol
+    if "volume" not in filtered.columns:
+        filtered["volume"] = pd.NA
+    if "turnover" not in filtered.columns:
+        filtered["turnover"] = pd.NA
+
+    filtered["interval"] = normalized_interval
+    filtered["symbol"] = normalized_symbol
 
     return enrich_indicators(filtered)
 
@@ -70,11 +144,16 @@ def load_candles_from_db(
 ) -> pd.DataFrame:
     """Load candles from SQLite and attach indicators."""
 
+    normalized_symbol = _normalize_symbol(symbol)
+    normalized_interval = _normalize_interval(interval)
+
     start_dt = _parse_date(start) if start else None
     end_dt = _parse_date(end) if end else None
 
     with session_scope() as session:
-        query = select(Candle).where(Candle.symbol == symbol, Candle.interval == interval)
+        query = select(Candle).where(
+            Candle.symbol == normalized_symbol, Candle.interval == normalized_interval
+        )
         if start_dt:
             query = query.where(Candle.event_time >= start_dt)
         if end_dt:
