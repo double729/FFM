@@ -7,6 +7,7 @@
     <main class="layout__content">
       <section class="layout__left">
         <ImportForm class="panel" />
+        <PlaybackControls class="panel" />
         <TradingPanel class="panel" />
       </section>
       <section class="layout__right">
@@ -19,6 +20,7 @@
 <script setup>
 import CandleChart from './components/CandleChart.vue';
 import ImportForm from './components/ImportForm.vue';
+import PlaybackControls from './components/PlaybackControls.vue';
 import TradingPanel from './components/TradingPanel.vue';
 </script>
 

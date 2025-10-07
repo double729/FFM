@@ -1,13 +1,15 @@
-"""Market data utilities relying on AkShare."""
+"""Market data utilities relying on AkShare and the local database."""
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Iterable, Tuple
+from typing import Iterable, List, Tuple
 
 import akshare as ak
 import pandas as pd
+from sqlalchemy import func, select
 
+from ..database import session_scope
 from ..models import Candle
 from ..utils.indicators import enrich_indicators
 
@@ -59,6 +61,60 @@ def fetch_candles(symbol: str, start: str, end: str, interval: str = "1d") -> pd
     return enrich_indicators(filtered)
 
 
+def load_candles_from_db(
+    symbol: str,
+    *,
+    interval: str = "1d",
+    start: str | None = None,
+    end: str | None = None,
+) -> pd.DataFrame:
+    """Load candles from SQLite and attach indicators."""
+
+    start_dt = _parse_date(start) if start else None
+    end_dt = _parse_date(end) if end else None
+
+    with session_scope() as session:
+        query = select(Candle).where(Candle.symbol == symbol, Candle.interval == interval)
+        if start_dt:
+            query = query.where(Candle.event_time >= start_dt)
+        if end_dt:
+            query = query.where(Candle.event_time <= end_dt)
+        query = query.order_by(Candle.event_time.asc())
+
+        rows: List[Candle] = [row[0] for row in session.execute(query).all()]
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "event_time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "turnover",
+            ]
+        )
+
+    frame = pd.DataFrame(
+        [
+            {
+                "event_time": candle.event_time,
+                "open": candle.open,
+                "high": candle.high,
+                "low": candle.low,
+                "close": candle.close,
+                "volume": candle.volume,
+                "turnover": candle.turnover,
+            }
+            for candle in rows
+        ]
+    )
+
+    frame.sort_values("event_time", inplace=True)
+    return enrich_indicators(frame)
+
+
 def convert_to_models(frame: pd.DataFrame) -> Iterable[Candle]:
     """Transform a dataframe into Candle model instances."""
 
@@ -86,3 +142,32 @@ def convert_to_models(frame: pd.DataFrame) -> Iterable[Candle]:
             volume=None if pd.isna(record[7]) else float(record[7]),
             turnover=None if pd.isna(record[8]) else float(record[8]),
         )
+
+
+def list_available_contracts() -> list[dict[str, object]]:
+    """Return imported contracts along with their available date ranges."""
+
+    with session_scope() as session:
+        results = session.execute(
+            select(
+                Candle.symbol,
+                Candle.interval,
+                func.min(Candle.event_time),
+                func.max(Candle.event_time),
+                func.count(),
+            ).group_by(Candle.symbol, Candle.interval)
+        ).all()
+
+    payload = []
+    for symbol, interval, start_dt, end_dt, count in results:
+        payload.append(
+            {
+                "symbol": symbol,
+                "interval": interval,
+                "start_date": start_dt.isoformat() if start_dt else None,
+                "end_date": end_dt.isoformat() if end_dt else None,
+                "records": int(count or 0),
+            }
+        )
+
+    return payload

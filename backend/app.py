@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from decimal import Decimal
-from typing import Dict, List
+from typing import Dict
 
 import pandas as pd
 from flask import Flask, jsonify, request
@@ -13,12 +12,16 @@ from sqlalchemy import and_, select
 
 from .database import init_db, session_scope
 from .models import Candle, SimulatedTrade
-from .services.market_data import convert_to_models, fetch_candles
+from .services.market_data import convert_to_models, fetch_candles, list_available_contracts, load_candles_from_db
+from .services.playback import PlaybackManager
 from .services.trading import DIRECTION_MULTIPLIER, summarize_portfolio
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 init_db()
+
+
+playback_manager = PlaybackManager()
 
 
 @app.route("/api/health", methods=["GET"])
@@ -73,6 +76,13 @@ def import_data() -> tuple[Dict[str, str], int]:
     return {"imported": imported}, 201
 
 
+@app.route("/api/contracts", methods=["GET"])
+def contracts():
+    """Return imported contract metadata."""
+
+    return jsonify({"items": list_available_contracts()})
+
+
 @app.route("/api/candles", methods=["GET"])
 def list_candles():
     """Return candles with indicators for the chart."""
@@ -85,56 +95,107 @@ def list_candles():
     if not symbol:
         return {"message": "symbol is required"}, 400
 
-    with session_scope() as session:
-        query = select(Candle).where(Candle.symbol == symbol, Candle.interval == interval)
-        if start:
-            query = query.where(Candle.event_time >= datetime.fromisoformat(start))
-        if end:
-            query = query.where(Candle.event_time <= datetime.fromisoformat(end))
-        query = query.order_by(Candle.event_time.asc())
+    frame = load_candles_from_db(symbol, interval=interval, start=start, end=end)
 
-        candles: List[Candle] = [row[0] for row in session.execute(query).all()]
-
-    if not candles:
+    if frame.empty:
         return {"items": []}, 200
-
-    frame = pd.DataFrame(
-        [
-            {
-                "event_time": candle.event_time,
-                "open": candle.open,
-                "high": candle.high,
-                "low": candle.low,
-                "close": candle.close,
-                "volume": candle.volume,
-                "turnover": candle.turnover,
-            }
-            for candle in candles
-        ]
-    ).sort_values("event_time")
-
-    from .utils.indicators import enrich_indicators  # imported lazily to avoid circular deps
-
-    frame = enrich_indicators(frame)
 
     response = [
         {
-            "event_time": row.event_time.isoformat(),
-            "open": row.open,
-            "high": row.high,
-            "low": row.low,
-            "close": row.close,
-            "volume": row.volume,
-            "turnover": row.turnover,
-            "boll_mid": row.boll_mid,
-            "boll_upper": row.boll_upper,
-            "boll_lower": row.boll_lower,
-            "volume_ma": row.volume_ma,
+            "event_time": (
+                row.event_time.to_pydatetime().isoformat()
+                if hasattr(row.event_time, "to_pydatetime")
+                else row.event_time.isoformat()
+            ),
+            "open": float(row.open),
+            "high": float(row.high),
+            "low": float(row.low),
+            "close": float(row.close),
+            "volume": None if pd.isna(row.volume) else float(row.volume),
+            "turnover": None if pd.isna(row.turnover) else float(row.turnover),
+            "boll_mid": None if pd.isna(row.boll_mid) else float(row.boll_mid),
+            "boll_upper": None if pd.isna(row.boll_upper) else float(row.boll_upper),
+            "boll_lower": None if pd.isna(row.boll_lower) else float(row.boll_lower),
+            "volume_ma": None if pd.isna(row.volume_ma) else float(row.volume_ma),
         }
         for row in frame.itertuples()
     ]
 
     return jsonify({"items": response})
+
+
+@app.route("/api/playback/start", methods=["POST"])
+def playback_start():
+    payload = request.get_json(force=True)
+    symbol = payload.get("symbol")
+    interval = payload.get("interval", "1d")
+    start_date = payload.get("start_date")
+    end_date = payload.get("end_date")
+
+    if not symbol:
+        return {"message": "symbol is required"}, 400
+
+    try:
+        state = playback_manager.start(
+            symbol,
+            interval=interval,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    except ValueError as exc:
+        return {"message": str(exc)}, 400
+
+    return jsonify({"status": state.as_dict()})
+
+
+@app.route("/api/playback/pause", methods=["POST"])
+def playback_pause():
+    try:
+        state = playback_manager.pause()
+    except ValueError as exc:
+        return {"message": str(exc)}, 400
+    return jsonify({"status": state.as_dict()})
+
+
+@app.route("/api/playback/resume", methods=["POST"])
+def playback_resume():
+    try:
+        state = playback_manager.resume()
+    except ValueError as exc:
+        return {"message": str(exc)}, 400
+    return jsonify({"status": state.as_dict()})
+
+
+@app.route("/api/playback/seek", methods=["POST"])
+def playback_seek():
+    payload = request.get_json(force=True)
+    timestamp = payload.get("timestamp")
+    if not timestamp:
+        return {"message": "timestamp is required"}, 400
+    try:
+        state = playback_manager.seek(timestamp)
+    except ValueError as exc:
+        return {"message": str(exc)}, 400
+    return jsonify({"status": state.as_dict()})
+
+
+@app.route("/api/playback/status", methods=["GET"])
+def playback_status():
+    state = playback_manager.status()
+    if not state:
+        return jsonify({"status": None})
+    return jsonify({"status": state.as_dict()})
+
+
+@app.route("/api/playback/next", methods=["GET"])
+def playback_next():
+    count = request.args.get("count", default=1, type=int)
+    try:
+        items, state = playback_manager.next(count)
+    except ValueError as exc:
+        return {"message": str(exc)}, 400
+
+    return jsonify({"items": list(items), "status": state.as_dict(), "has_more": state.index < state.frame.shape[0]})
 
 
 @app.route("/api/trades", methods=["GET"])
