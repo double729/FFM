@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import pandas as pd
-from flask import Blueprint, Flask, jsonify, request, current_app
+from flask import Blueprint, Flask, jsonify, request, current_app, send_from_directory
 from flask_cors import CORS
 from sqlalchemy import and_, select
 
@@ -496,9 +496,8 @@ def _resolve_frontend_dir() -> Optional[Path]:
 
 def create_app() -> Flask:
     frontend_dir = _resolve_frontend_dir()
-    static_folder = str(frontend_dir) if frontend_dir else None
-    app = Flask(__name__, static_folder=static_folder, static_url_path="")
-    app.config["FFM_FRONTEND_DIR"] = frontend_dir
+    app = Flask(__name__)
+    app.config["FFM_FRONTEND_DIR"] = str(frontend_dir) if frontend_dir else None
     CORS(app, resources={r"/api/*": {"origins": "*"}})
 
     init_db()
@@ -512,10 +511,30 @@ def create_app() -> Flask:
     app.register_blueprint(api_bp, url_prefix="/api")
 
     if frontend_dir and (frontend_dir / "index.html").exists():
+        frontend_root = str(frontend_dir)
 
         @app.route("/")
         def index():  # pragma: no cover - thin wrapper
-            return app.send_static_file("index.html")
+            return send_from_directory(frontend_root, "index.html")
+
+        @app.route("/<path:asset>")
+        def frontend_assets(asset: str):  # pragma: no cover - thin wrapper
+            if asset.startswith("api/"):
+                return jsonify({"message": "Not Found"}), 404
+
+            target = frontend_dir / asset
+            if target.exists() and target.is_file():
+                return send_from_directory(frontend_root, asset)
+
+            return (
+                jsonify(
+                    {
+                        "message": "Requested frontend asset not found.",
+                        "asset": asset,
+                    }
+                ),
+                404,
+            )
 
     else:
 
