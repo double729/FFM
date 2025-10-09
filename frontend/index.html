@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>简易期货训练平台</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="app" class="layout" v-cloak>
+      <header class="header">
+        <h1>简易期货训练平台</h1>
+        <span>离线行情 · 回放训练 · 模拟交易</span>
+      </header>
+
+      <main class="content">
+        <section class="panel">
+          <h2>行情导入</h2>
+          <form @submit.prevent="importData">
+            <div class="form-grid">
+              <label>
+                <span>品种代码</span>
+                <input v-model="filters.symbol" placeholder="如：RB2210" required />
+              </label>
+              <label>
+                <span>开始日期</span>
+                <input v-model="filters.startDate" type="date" required />
+              </label>
+              <label>
+                <span>结束日期</span>
+                <input v-model="filters.endDate" type="date" required />
+              </label>
+              <label>
+                <span>周期</span>
+                <select v-model="filters.interval">
+                  <option v-for="item in availableIntervals" :key="item.value" :value="item.value">
+                    {{ item.label }}
+                  </option>
+                </select>
+              </label>
+            </div>
+            <div class="actions">
+              <button type="submit" :disabled="importState.loading">
+                {{ importState.loading ? '正在导入...' : '导入行情' }}
+              </button>
+              <button type="button" @click="loadCandles" :disabled="!filters.symbol">
+                读取本地缓存
+              </button>
+            </div>
+          </form>
+          <p v-if="importState.message" class="message">{{ importState.message }}</p>
+        </section>
+
+        <section class="panel">
+          <h2>已导入合约</h2>
+          <div v-if="contracts.length === 0" class="empty-hint">暂无记录，请先导入行情。</div>
+          <div v-else class="form-grid">
+            <label>
+              <span>选择合约</span>
+              <select v-model="selectedContract">
+                <option
+                  v-for="item in contracts"
+                  :key="item.symbol + '-' + item.interval"
+                  :value="item.symbol + '|' + item.interval"
+                >
+                  {{ item.symbol }} · {{ item.interval }} ·
+                  {{ item.start_date ? item.start_date.slice(0, 10) : '-' }} ~
+                  {{ item.end_date ? item.end_date.slice(0, 10) : '-' }}
+                </option>
+              </select>
+            </label>
+            <label>
+              <span>可用区间（自动同步到上方表单）</span>
+              <input
+                :value="selectedRange"
+                readonly
+              />
+            </label>
+            <div class="actions">
+              <button type="button" @click="loadCandles">加载K线</button>
+              <button type="button" @click="refreshContracts">刷新列表</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel chart-panel">
+          <h2>K线 / BOLL / 成交量</h2>
+          <div id="chart" class="chart-container"></div>
+        </section>
+
+        <section class="panel">
+          <h2>回放控制</h2>
+          <div class="control-row">
+            <button type="button" @click="startPlayback" :disabled="!filters.symbol">开始回放</button>
+            <button type="button" @click="pausePlayback" :disabled="!playback.active">暂停</button>
+            <button type="button" @click="resumePlayback" :disabled="!playback.active">继续</button>
+            <button type="button" @click="manualStep" :disabled="!playback.active">单步获取</button>
+          </div>
+          <div class="control-row">
+            <label>
+              批量大小
+              <input type="number" min="1" v-model.number="playback.batchSize" />
+            </label>
+            <label>
+              播放间隔 (ms)
+              <input type="number" min="100" step="100" v-model.number="playback.speed" />
+            </label>
+          </div>
+          <p v-if="playback.status" class="message">
+            进度：{{ playback.status.current_index }} / {{ playback.status.total }}，当前时间：
+            {{ playback.status.current_time || '未开始' }}
+          </p>
+          <p v-if="playback.message" class="message">{{ playback.message }}</p>
+        </section>
+
+        <section class="panel">
+          <h2>模拟交易</h2>
+          <form @submit.prevent="submitOrder">
+            <div class="form-grid">
+              <label>
+                <span>品种</span>
+                <input v-model="orderForm.symbol" placeholder="如：RB2210" required />
+              </label>
+              <label>
+                <span>方向</span>
+                <select v-model="orderForm.direction">
+                  <option value="buy">买入</option>
+                  <option value="sell">卖出</option>
+                </select>
+              </label>
+              <label>
+                <span>订单类型</span>
+                <select v-model="orderForm.orderType">
+                  <option value="market">市价</option>
+                  <option value="limit">限价</option>
+                </select>
+              </label>
+              <label>
+                <span>{{ orderForm.orderType === 'limit' ? '限价' : '参考价 (可选)' }}</span>
+                <input
+                  v-model.number="orderForm.price"
+                  type="number"
+                  step="0.01"
+                  :required="orderForm.orderType === 'limit'"
+                  :placeholder="orderForm.orderType === 'limit' ? '必填' : '可选'"
+                />
+              </label>
+              <label>
+                <span>数量</span>
+                <input v-model.number="orderForm.quantity" type="number" min="1" required />
+              </label>
+            </div>
+            <label>
+              <small>备注</small>
+              <textarea v-model="orderForm.note" rows="2" placeholder="可选" />
+            </label>
+            <div class="actions" style="margin-top: 12px;">
+              <button type="submit">提交订单</button>
+              <button type="button" @click="loadOrders">刷新订单</button>
+              <button type="button" @click="loadTrades">刷新成交</button>
+              <button type="button" @click="loadPortfolio">刷新持仓</button>
+            </div>
+          </form>
+          <p v-if="orderMessage" class="message">{{ orderMessage }}</p>
+
+          <h3 class="sub-heading">当前订单</h3>
+          <div class="table-wrapper" v-if="orders.length">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>品种</th>
+                  <th>方向</th>
+                  <th>类型</th>
+                  <th>价格</th>
+                  <th>数量</th>
+                  <th>已成交</th>
+                  <th>均价</th>
+                  <th>状态</th>
+                  <th>时间</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="item in orders" :key="item.id">
+                  <td>{{ item.id }}</td>
+                  <td>{{ item.symbol }}</td>
+                  <td>{{ item.direction }}</td>
+                  <td>{{ item.order_type }}</td>
+                  <td>{{ item.price != null ? item.price.toFixed(2) : '-' }}</td>
+                  <td>{{ item.quantity }}</td>
+                  <td>{{ item.filled_quantity }}</td>
+                  <td>{{ item.avg_fill_price != null ? item.avg_fill_price.toFixed(2) : '-' }}</td>
+                  <td>{{ item.status }}</td>
+                  <td>{{ item.created_at.replace('T', ' ').slice(0, 19) }}</td>
+                  <td>
+                    <div class="trade-actions">
+                      <button type="button" @click="cancelOrder(item.id)" v-if="item.status === 'open'">撤单</button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-else class="empty-hint">暂无订单。</div>
+
+          <h3 class="sub-heading">成交记录</h3>
+          <div class="table-wrapper" v-if="trades.length">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>订单</th>
+                  <th>品种</th>
+                  <th>方向</th>
+                  <th>价格</th>
+                  <th>数量</th>
+                  <th>时间</th>
+                  <th>备注</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="item in trades" :key="item.id">
+                  <td>{{ item.id }}</td>
+                  <td>{{ item.order_id || '-' }}</td>
+                  <td>{{ item.symbol }}</td>
+                  <td>{{ item.direction }}</td>
+                  <td>{{ item.price.toFixed(2) }}</td>
+                  <td>{{ item.quantity }}</td>
+                  <td>{{ item.trade_time.replace('T', ' ').slice(0, 19) }}</td>
+                  <td>{{ item.note || '-' }}</td>
+                  <td>
+                    <div class="trade-actions">
+                      <button type="button" @click="removeTrade(item.id)">删除</button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-else class="empty-hint">暂无成交记录。</div>
+        </section>
+
+        <section class="panel">
+          <h2>持仓汇总</h2>
+          <div v-if="hasPositions" class="position-list">
+            <div class="position-item" v-for="(pos, symbol) in portfolio.positions" :key="symbol">
+              <div>
+                <strong>{{ symbol }}</strong>
+                <div>方向：{{ pos.direction }}</div>
+                <div>数量：{{ pos.quantity }}</div>
+                <div>均价：{{ pos.average_price.toFixed(2) }}</div>
+              </div>
+              <div>
+                <div>最新价：{{ pos.last_price != null ? pos.last_price.toFixed(2) : '-' }}</div>
+              </div>
+            </div>
+          </div>
+          <div v-else class="empty-hint">暂无持仓。</div>
+          <div class="account-summary">
+            <div>
+              <span>现金余额</span>
+              <strong>{{ portfolio.cash.toFixed(2) }}</strong>
+            </div>
+            <div>
+              <span>账户权益</span>
+              <strong>{{ portfolio.equity.toFixed(2) }}</strong>
+            </div>
+            <div>
+              <span>保证金占用</span>
+              <strong>{{ portfolio.margin_used.toFixed(2) }}</strong>
+            </div>
+            <div>
+              <span>可用资金</span>
+              <strong>{{ portfolio.available_funds.toFixed(2) }}</strong>
+            </div>
+          </div>
+          <div class="pnl-summary">
+            <div>已实现盈亏：{{ portfolio.realized_pnl.toFixed(2) }}</div>
+            <div>未实现盈亏：{{ portfolio.unrealized_pnl.toFixed(2) }}</div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      window.FFM_API_BASE = window.FFM_API_BASE || 'http://localhost:8000/api';
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/axios@1/dist/axios.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
